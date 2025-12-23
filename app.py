@@ -13,7 +13,7 @@ import streamlit as st
 # ========= パス設定 =========
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "selected_advanced_vwap_indicators_model.txt")
-STOCK_MASTER_PATH = os.path.join(BASE_DIR, "stock_all.xls")
+STOCK_MASTER_PATH = os.path.join(BASE_DIR, "stock_all.xlsx")
 
 
 # ========= 194特徴量 Predictor（Flask 版をそのまま流用） =========
