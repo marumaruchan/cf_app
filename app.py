@@ -366,7 +366,8 @@ def get_predictor():
 
 @st.cache_data
 def load_stock_master():
-    df = pd.read_excel(STOCK_MASTER_PATH)
+    # engine='openpyxl' を追加（.xls でも強制的に openpyxl で読む）
+    df = pd.read_excel(STOCK_MASTER_PATH, engine='openpyxl')
     df = df.dropna(subset=["コード"]).copy()
     df["コード"] = df["コード"].astype(str).str.zfill(4)
     df["銘柄名"] = df["銘柄名"].astype(str)
