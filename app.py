@@ -8,8 +8,6 @@ import pandas as pd
 import yfinance as yf
 import lightgbm as lgb
 import streamlit as st
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 
 # ========= パス設定 =========
@@ -359,11 +357,8 @@ class HighSpeedComplete194Predictor:
             "latest_date": latest_date,
             "days_old": int(days_since),
             "rsi_9": float(df["RSI_9"].iloc[-1]) if "RSI_9" in df.columns else None,
-            "rsi_14": float(df["RSI_14"].iloc[-1]) if "RSI_14" in df.columns else None,
             "vwap_20d": float(df["VWAP_20d"].iloc[-1]) if "VWAP_20d" in df.columns else None,
             "adx": float(df["ADX"].iloc[-1]) if "ADX" in df.columns else None,
-            "macd": float(df["MACD"].iloc[-1]) if "MACD" in df.columns else None,
-            "bb_percent": float(df["BB_percent"].iloc[-1]) if "BB_percent" in df.columns else None,
         }
 
 
@@ -376,7 +371,7 @@ def get_predictor():
 
 @st.cache_data
 def load_stock_master():
-    df = pd.read_excel(STOCK_MASTER_PATH)
+    df = pd.read_excel(STOCK_MASTER_PATH, engine='openpyxl')
     df = df.dropna(subset=["コード"]).copy()
     df["コード"] = df["コード"].astype(str).str.zfill(4)
     df["銘柄名"] = df["銘柄名"].astype(str)
@@ -384,17 +379,28 @@ def load_stock_master():
 
 
 @st.cache_data(ttl=3600)
-def fetch_price_history(code: str, days: int, interval: str = "1d"):
-    """価格履歴取得（キャッシュ付き）"""
+def fetch_price_history(code: str, period: str, interval: str):
+    if period == "3ヶ月":
+        days = 90
+    elif period == "6ヶ月":
+        days = 180
+    elif period == "1年":
+        days = 365
+    elif period == "2年":
+        days = 730
+    else:
+        days = 365 * 5
+    
     end = datetime.now()
     start = end - timedelta(days=days)
+    yf_interval = {"日足": "1d", "週足": "1wk", "月足": "1mo"}[interval]
     
     rate_limited_sleep()
     
     try:
-        df = yf.Ticker(f"{code}.T").history(start=start, end=end, interval=interval)
+        df = yf.Ticker(f"{code}.T").history(start=start, end=end, interval=yf_interval)
     except Exception as e:
-        st.error(f"{code} データ取得失敗: {e}")
+        st.error(f"{code} のデータ取得に失敗: {e}")
         return None
     
     if df.empty:
@@ -404,262 +410,325 @@ def fetch_price_history(code: str, days: int, interval: str = "1d"):
     return df
 
 
-def create_chart_with_indicators(df, code, name, pred_data=None):
-    """Flask版と同じ見た目のチャート生成"""
-    fig = make_subplots(
-        rows=3, cols=1,
-        shared_xaxes=True,
-        row_heights=[0.5, 0.25, 0.25],
-        vertical_spacing=0.02,
-        subplot_titles=("価格", "出来高", "RSI"),
-    )
-
-    # ローソク足
-    fig.add_trace(
-        go.Candlestick(
-            x=df.index,
-            open=df["Open"],
-            high=df["High"],
-            low=df["Low"],
-            close=df["Close"],
-            name="Price",
-            increasing_line_color='#26a69a',
-            decreasing_line_color='#ef5350',
-        ),
-        row=1, col=1,
-    )
-
-    # 移動平均線（SMA20, SMA50）
-    if len(df) >= 50:
-        sma20 = df["Close"].rolling(20).mean()
-        sma50 = df["Close"].rolling(50).mean()
-        fig.add_trace(go.Scatter(x=df.index, y=sma20, name="SMA20", line=dict(color="orange", width=1)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=sma50, name="SMA50", line=dict(color="blue", width=1)), row=1, col=1)
-
-    # 出来高
-    colors = ['red' if df['Close'].iloc[i] < df['Open'].iloc[i] else 'green' for i in range(len(df))]
-    fig.add_trace(
-        go.Bar(x=df.index, y=df["Volume"], name="Volume", marker_color=colors, showlegend=False),
-        row=2, col=1,
-    )
-
-    # RSI
-    if len(df) >= 14:
-        rsi = HighSpeedComplete194Predictor.calculate_rsi_fast(df["Close"], 14)
-        fig.add_trace(go.Scatter(x=df.index, y=rsi, name="RSI", line=dict(color="purple", width=1.5)), row=3, col=1)
-        fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.5, row=3, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="blue", opacity=0.5, row=3, col=1)
-
-    fig.update_layout(
-        title=dict(
-            text=f"【{code}】{name}",
-            font=dict(size=20, color="#333"),
-            x=0.5,
-            xanchor="center",
-        ),
-        height=700,
-        margin=dict(l=50, r=50, t=80, b=40),
-        xaxis_rangeslider_visible=False,
-        hovermode="x unified",
-        plot_bgcolor="#fafafa",
-        paper_bgcolor="white",
-    )
+# ========= カスタムCSS（index.html風） =========
+def inject_custom_css():
+    st.markdown("""
+    <style>
+    /* 全体の背景を白に */
+    .stApp {
+        background-color: #ffffff;
+    }
     
-    fig.update_xaxes(showgrid=True, gridcolor="#e0e0e0")
-    fig.update_yaxes(showgrid=True, gridcolor="#e0e0e0")
+    /* サイドバーのスタイル */
+    [data-testid="stSidebar"] {
+        background-color: #f8f8f8;
+        border-right: 1px solid #e0e0e0;
+    }
     
-    return fig
+    [data-testid="stSidebar"] h1, 
+    [data-testid="stSidebar"] h2, 
+    [data-testid="stSidebar"] h3 {
+        color: #333;
+        font-size: 16px;
+        font-weight: 600;
+        padding: 12px 0 8px 0;
+    }
+    
+    /* ボタンのスタイル */
+    .stButton button {
+        background: #1a73e8;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        padding: 10px 24px;
+        font-weight: 500;
+        transition: all 0.2s;
+    }
+    
+    .stButton button:hover {
+        background: #1557b0;
+        box-shadow: 0 2px 8px rgba(26, 115, 232, 0.3);
+    }
+    
+    /* セレクトボックス */
+    .stSelectbox, .stMultiSelect {
+        background: white;
+        border-radius: 4px;
+    }
+    
+    /* ラジオボタン */
+    .stRadio > div {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+    }
+    
+    .stRadio label {
+        background: white;
+        padding: 8px 16px;
+        border-radius: 6px;
+        border: 1px solid #e0e0e0;
+        cursor: pointer;
+        transition: all 0.2s;
+    }
+    
+    .stRadio label:hover {
+        border-color: #1a73e8;
+        background: #f0f7ff;
+    }
+    
+    /* チャートカード風 */
+    .element-container {
+        background: white;
+        border-radius: 8px;
+    }
+    
+    /* データフレーム */
+    .stDataFrame {
+        border: 1px solid #e0e0e0;
+        border-radius: 6px;
+        overflow: hidden;
+    }
+    
+    /* メインエリアの見出し */
+    h1, h2, h3 {
+        color: #333;
+        font-weight: 600;
+    }
+    
+    /* プログレスバー */
+    .stProgress > div > div {
+        background-color: #1a73e8;
+    }
+    
+    /* 情報ボックス */
+    .stInfo {
+        background-color: #e8f4f8;
+        border-left: 4px solid #1a73e8;
+        padding: 12px;
+        border-radius: 4px;
+    }
+    
+    /* 警告ボックス */
+    .stWarning {
+        background-color: #fff4e5;
+        border-left: 4px solid #ff9800;
+    }
+    
+    /* キャプション */
+    .stCaption {
+        color: #666;
+        font-size: 13px;
+    }
+    
+    /* マルチセレクトのチップ */
+    .stMultiSelect [data-baseweb="tag"] {
+        background-color: #1a73e8;
+        color: white;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
 
-# ========= Streamlit UI（Flask版と同じ見た目） =========
+# ========= Streamlit UI =========
 def main():
     st.set_page_config(
-        page_title="194特徴量完全版AI株価予測",
+        page_title="📈 194特徴量AIチャート",
         layout="wide",
         initial_sidebar_state="expanded",
     )
 
-    # カスタムCSS（Flask版風）
-    st.markdown("""
-    <style>
-        .main-title {
-            font-size: 3rem;
-            font-weight: bold;
-            text-align: center;
-            color: #1f77b4;
-            margin-bottom: 0.5rem;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
-        }
-        .subtitle {
-            font-size: 1.2rem;
-            text-align: center;
-            color: #666;
-            margin-bottom: 2rem;
-        }
-        .metric-card {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            padding: 1.5rem;
-            border-radius: 12px;
-            color: white;
-            text-align: center;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-        .metric-card h2 {
-            font-size: 3rem;
-            margin: 0;
-            font-weight: bold;
-        }
-        .metric-card p {
-            font-size: 1rem;
-            margin: 0.5rem 0 0 0;
-            opacity: 0.9;
-        }
-        .indicator-card {
-            background: white;
-            padding: 1rem;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            border-left: 4px solid #1f77b4;
-        }
-        .indicator-card h4 {
-            margin: 0 0 0.5rem 0;
-            color: #333;
-            font-size: 0.9rem;
-        }
-        .indicator-card .value {
-            font-size: 1.5rem;
-            font-weight: bold;
-            color: #1f77b4;
-        }
-    </style>
-    """, unsafe_allow_html=True)
+    inject_custom_css()
 
-    # タイトル（Flask版と同じ）
-    st.markdown('<div class="main-title">📊 194特徴量 完全版AI株価予測チャート</div>', unsafe_allow_html=True)
-    st.markdown('<div class="subtitle">LightGBM × VWAP × 194種テクニカル指標</div>', unsafe_allow_html=True)
+    st.title("📈 194特徴量AIチャート")
 
     df_master = load_stock_master()
     predictor = get_predictor()
 
-    # サイドバー
+    # --- サイドバー ---
     with st.sidebar:
-        st.header("🔍 銘柄検索")
-        search = st.text_input("銘柄名 or コード")
-        
+        st.markdown("### 銘柄選択")
+
+        search = st.text_input("🔍 銘柄名 / コードで検索", placeholder="例: 7203 または トヨタ")
         df_show = df_master
         if search:
             s = search.strip()
             df_show = df_master[
-                df_master["コード"].str.contains(s, na=False)
-                | df_master["銘柄名"].str.contains(s, na=False)
+                df_master["コード"].str.contains(s, na=False, case=False)
+                | df_master["銘柄名"].str.contains(s, na=False, case=False)
             ]
 
-        if not df_show.empty:
-            codes = df_show["コード"].tolist()
-            names = df_show["銘柄名"].tolist()
-            options = [f"{c} - {n}" for c, n in zip(codes, names)]
-            
-            selected = st.selectbox("銘柄を選択", options, index=0)
-            selected_code = selected.split(" - ")[0]
-        else:
-            st.warning("該当銘柄なし")
-            selected_code = None
+        codes = df_show.head(100)["コード"].tolist()  # 検索結果は100件まで
+        selected_codes = st.multiselect(
+            "表示する銘柄",
+            options=codes,
+            format_func=lambda c: f"{c} | {df_master.loc[df_master['コード']==c,'銘柄名'].iloc[0]}",
+            max_selections=20,
+        )
 
         st.markdown("---")
-        st.subheader("⚙️ 表示設定")
-        period_days = st.slider("表示期間（日）", 30, 730, 365, step=30)
+        st.markdown("### チャート設定")
         
-        st.markdown("---")
-        analyze_btn = st.button("🚀 AI分析実行", use_container_width=True, type="primary")
+        cols_row = st.columns([1, 1, 1, 1])
+        col_nums = [1, 2, 3, 4]
+        selected_col = st.radio(
+            "表示列数",
+            col_nums,
+            index=1,
+            horizontal=True,
+            label_visibility="collapsed"
+        )
+        
+        interval = st.selectbox("📊 足", ["日足", "週足", "月足"], index=0)
+        period = st.selectbox("📅 期間", ["3ヶ月", "6ヶ月", "1年", "2年", "5年"], index=2)
 
-    if selected_code is None:
-        st.info("左のサイドバーで銘柄を選択してください")
+        st.markdown("---")
+        st.markdown("### AI分析")
+        run_ai = st.button("🤖 AI分析実行", use_container_width=True)
+        
+        if selected_codes:
+            st.info(f"⚠️ {len(selected_codes)}銘柄を分析します（約{len(selected_codes)*0.5:.0f}秒）")
+
+    # メイン表示
+    st.markdown(f"**選択中: {len(selected_codes)} 銘柄**")
+
+    # --- AI分析 ---
+    ai_results = None
+    if run_ai and selected_codes:
+        st.markdown("---")
+        st.subheader("🤖 AI分析結果")
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        rows = []
+        
+        for i, code in enumerate(selected_codes):
+            status_text.text(f"解析中: {code} ({i+1}/{len(selected_codes)})")
+            pred = predictor.get_fast_prediction(code)
+            
+            if pred is not None:
+                name = df_master.loc[df_master["コード"] == code, "銘柄名"].iloc[0]
+                rows.append({
+                    "順位": 0,
+                    "コード": code,
+                    "銘柄名": name,
+                    "予測確率": pred["prediction"],
+                    "最新株価": pred["latest_price"],
+                    "RSI(9)": pred["rsi_9"],
+                    "VWAP(20d)": pred["vwap_20d"],
+                    "ADX": pred["adx"],
+                    "データ日": pred["latest_date"].strftime("%Y-%m-%d"),
+                })
+            
+            progress_bar.progress((i + 1) / len(selected_codes))
+        
+        status_text.empty()
+        progress_bar.empty()
+        
+        if rows:
+            ai_results = pd.DataFrame(rows).sort_values("予測確率", ascending=False)
+            ai_results["順位"] = range(1, len(ai_results) + 1)
+            
+            st.dataframe(
+                ai_results.style.format({
+                    "予測確率": "{:.3f}",
+                    "最新株価": "{:.0f}",
+                    "RSI(9)": "{:.1f}",
+                    "VWAP(20d)": "{:.0f}",
+                    "ADX": "{:.1f}",
+                }).background_gradient(subset=["予測確率"], cmap="RdYlGn", vmin=0, vmax=1),
+                use_container_width=True,
+                height=400,
+            )
+
+    # --- チャート表示 ---
+    if not selected_codes:
+        st.markdown("---")
+        st.info("👈 左のサイドバーで銘柄を選択してください")
         return
 
-    name = df_master.loc[df_master["コード"] == selected_code, "銘柄名"].iloc[0]
-
-    # AI分析実行
-    pred_data = None
-    if analyze_btn:
-        with st.spinner(f"{selected_code} {name} を分析中..."):
-            pred_data = predictor.get_fast_prediction(selected_code)
-
-    # 予測結果を大きく表示（Flask版風）
-    if pred_data:
-        st.markdown("### 🤖 AI予測結果")
-        
-        col1, col2, col3 = st.columns([2, 1, 1])
-        
-        with col1:
-            pred_score = pred_data["prediction"]
-            score_percent = pred_score * 100
-            
-            if pred_score >= 0.7:
-                color_grad = "linear-gradient(135deg, #11998e 0%, #38ef7d 100%)"
-                signal = "🟢 強気"
-            elif pred_score >= 0.5:
-                color_grad = "linear-gradient(135deg, #f093fb 0%, #f5576c 100%)"
-                signal = "🟡 中立"
-            else:
-                color_grad = "linear-gradient(135deg, #fa709a 0%, #fee140 100%)"
-                signal = "🔴 弱気"
-            
-            st.markdown(f"""
-            <div style="background: {color_grad}; padding: 2rem; border-radius: 12px; color: white; text-align: center; box-shadow: 0 6px 12px rgba(0,0,0,0.15);">
-                <h2 style="margin: 0; font-size: 3.5rem; font-weight: bold;">{score_percent:.1f}%</h2>
-                <p style="margin: 0.5rem 0 0 0; font-size: 1.3rem; opacity: 0.95;">{signal}</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col2:
-            st.markdown(f"""
-            <div class="indicator-card">
-                <h4>最新株価</h4>
-                <div class="value">¥{pred_data['latest_price']:,.0f}</div>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col3:
-            st.markdown(f"""
-            <div class="indicator-card">
-                <h4>データ日付</h4>
-                <div class="value" style="font-size: 1.2rem;">{pred_data['latest_date'].strftime('%m/%d')}</div>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        # テクニカル指標カード
-        st.markdown("### 📈 主要テクニカル指標")
-        col1, col2, col3, col4 = st.columns(4)
-        
-        indicators = [
-            ("RSI(9)", pred_data.get("rsi_9"), col1),
-            ("RSI(14)", pred_data.get("rsi_14"), col2),
-            ("ADX", pred_data.get("adx"), col3),
-            ("BB %", pred_data.get("bb_percent", 0) * 100 if pred_data.get("bb_percent") else None, col4),
-        ]
-        
-        for label, value, col in indicators:
-            with col:
-                if value is not None:
-                    st.markdown(f"""
-                    <div class="indicator-card">
-                        <h4>{label}</h4>
-                        <div class="value">{value:.1f}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-    # チャート表示
     st.markdown("---")
-    st.markdown("### 📊 価格チャート")
+    st.subheader("📊 チャート")
+
+    n = len(selected_codes)
+    rows_count = (n + selected_col - 1) // selected_col
+    idx = 0
     
-    df_price = fetch_price_history(selected_code, period_days)
-    
-    if df_price is not None and not df_price.empty:
-        fig = create_chart_with_indicators(df_price, selected_code, name, pred_data)
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.error("チャートデータを取得できませんでした")
+    for _ in range(rows_count):
+        cols_container = st.columns(selected_col)
+        for c in range(selected_col):
+            if idx >= n:
+                break
+            code = selected_codes[idx]
+            name = df_master.loc[df_master["コード"] == code, "銘柄名"].iloc[0]
+
+            with cols_container[c]:
+                with st.container():
+                    st.markdown(f"**{code} | {name}**")
+                    df_price = fetch_price_history(code, period, interval)
+                    
+                    if df_price is None or df_price.empty:
+                        st.warning("データ取得できず")
+                    else:
+                        import plotly.graph_objects as go
+                        from plotly.subplots import make_subplots
+
+                        fig = make_subplots(
+                            rows=2, cols=1,
+                            shared_xaxes=True,
+                            row_heights=[0.7, 0.3],
+                            vertical_spacing=0.03,
+                        )
+
+                        fig.add_trace(
+                            go.Candlestick(
+                                x=df_price.index,
+                                open=df_price["Open"],
+                                high=df_price["High"],
+                                low=df_price["Low"],
+                                close=df_price["Close"],
+                                name="Price",
+                                increasing_line_color='#26a69a',
+                                decreasing_line_color='#ef5350',
+                            ),
+                            row=1, col=1,
+                        )
+
+                        fig.add_trace(
+                            go.Bar(
+                                x=df_price.index,
+                                y=df_price["Volume"],
+                                name="Volume",
+                                marker_color='rgba(158, 158, 158, 0.5)',
+                            ),
+                            row=2, col=1,
+                        )
+
+                        fig.update_layout(
+                            height=400,
+                            margin=dict(l=20, r=20, t=30, b=20),
+                            showlegend=False,
+                            plot_bgcolor='white',
+                            paper_bgcolor='white',
+                            xaxis_gridcolor='#f0f0f0',
+                            yaxis_gridcolor='#f0f0f0',
+                        )
+                        
+                        fig.update_xaxes(showgrid=True, gridcolor='#f0f0f0')
+                        fig.update_yaxes(showgrid=True, gridcolor='#f0f0f0')
+                        
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        if ai_results is not None and code in ai_results["コード"].values:
+                            row = ai_results[ai_results["コード"] == code].iloc[0]
+                            st.caption(
+                                f"🤖 予測: **{row['予測確率']:.3f}** | "
+                                f"RSI(9): {row['RSI(9)']:.1f} | "
+                                f"ADX: {row['ADX']:.1f}"
+                            )
+            idx += 1
 
 
 if __name__ == "__main__":
     main()
+
