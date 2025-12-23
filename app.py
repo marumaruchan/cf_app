@@ -13,20 +13,40 @@ import streamlit as st
 # ========= パス設定 =========
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "selected_advanced_vwap_indicators_model.txt")
-STOCK_MASTER_PATH = os.path.join(BASE_DIR, "stock_all.xlsx")
+STOCK_MASTER_PATH = os.path.join(BASE_DIR, "stock_all.xls")
+
+# ========= グローバルレート制限用 =========
+_request_lock = threading.Lock()
+_last_request_time = 0
+_request_count = 0
 
 
-# ========= 194特徴量 Predictor（Flask 版をそのまま流用） =========
+def rate_limited_sleep():
+    """yfinance API呼び出し前に必ず呼ぶ"""
+    global _last_request_time, _request_count
+    with _request_lock:
+        now = time.time()
+        elapsed = now - _last_request_time
+        
+        # 最低0.5秒間隔を確保（Yahoo Finance推奨）
+        if elapsed < 0.5:
+            time.sleep(0.5 - elapsed)
+        
+        _last_request_time = time.time()
+        _request_count += 1
+        
+        # 50リクエストごとに5秒休憩
+        if _request_count % 50 == 0:
+            time.sleep(5)
+
+
+# ========= 194特徴量 Predictor =========
 class HighSpeedComplete194Predictor:
     def __init__(self, model_path: str):
         self.model_path = model_path
         self.model = None
         self.selected_194_features = []
         self._init_features()
-
-        self.request_count = 0
-        self.last_request_time = time.time()
-        self.request_lock = threading.Lock()
 
     def _init_features(self):
         base_features = [
@@ -95,17 +115,6 @@ class HighSpeedComplete194Predictor:
     def load_model(self):
         self.model = lgb.Booster(model_file=self.model_path)
 
-    def safe_api_call(self):
-        with self.request_lock:
-            now = time.time()
-            elapsed = now - self.last_request_time
-            if elapsed < 0.02:
-                time.sleep(0.05 - elapsed)
-            self.last_request_time = time.time()
-            self.request_count += 1
-            if self.request_count % 100 == 0:
-                time.sleep(2)
-
     @staticmethod
     def calculate_rsi_fast(price_series, period=14):
         delta = price_series.diff()
@@ -149,8 +158,7 @@ class HighSpeedComplete194Predictor:
 
         df["High_Low_Ratio"] = ((df["High"] - df["Low"]) / df["Close"]).fillna(0)
         df["Volume_RSI"] = self.calculate_rsi_fast(df["Volume"], 14)
-        df["CCI"] = ((df["Close"] - df["Close"].rolling(20).mean()) /
-                     (df["Close"].rolling(20).std() + 1e-8)).fillna(0)
+        df["CCI"] = ((df["Close"] - df["Close"].rolling(20).mean()) / (df["Close"].rolling(20).std() + 1e-8)).fillna(0)
         df["Williams_R"] = (-100 * (high_14 - df["Close"]) / (high_14 - low_14 + 1e-8)).fillna(-50)
         df["Ultimate_Oscillator"] = df["Close"].pct_change().rolling(14).mean().fillna(0) * 100
         df["ROC_10"] = ((df["Close"] - df["Close"].shift(10)) / df["Close"].shift(10) * 100).fillna(0)
@@ -254,14 +262,10 @@ class HighSpeedComplete194Predictor:
             df["Volume_Weighted_Return"] = df["Price_Change_1d"] * np.log(df["Volume_Change"].abs() + 1)
 
         combos = [
-            ("True_Range_Ratio", "ADX_neg"),
-            ("SMA_200", "Volume_SMA_20"),
-            ("OBV", "SMA_200"),
-            ("AD_Line", "MACD_signal"),
-            ("OBV", "MACD_signal"),
-            ("AD_Line", "OBV"),
-            ("True_Range_Ratio", "BB_width"),
-            ("AD_Line", "Volume_SMA_20"),
+            ("True_Range_Ratio", "ADX_neg"), ("SMA_200", "Volume_SMA_20"),
+            ("OBV", "SMA_200"), ("AD_Line", "MACD_signal"),
+            ("OBV", "MACD_signal"), ("AD_Line", "OBV"),
+            ("True_Range_Ratio", "BB_width"), ("AD_Line", "Volume_SMA_20"),
         ]
         for f1, f2 in combos:
             if f1 in df.columns and f2 in df.columns:
@@ -270,10 +274,8 @@ class HighSpeedComplete194Predictor:
                 df[f"{f1}_minus_{f2}"] = df[f1] - df[f2]
 
         polys = [
-            ("SMA_200", "SMA_100"),
-            ("OBV", "MACD_signal"),
-            ("AD_Line", "OBV"),
-            ("True_Range_Ratio", "OBV"),
+            ("SMA_200", "SMA_100"), ("OBV", "MACD_signal"),
+            ("AD_Line", "OBV"), ("True_Range_Ratio", "OBV"),
             ("OBV", "Volume_SMA_20"),
         ]
         for f1, f2 in polys:
@@ -314,11 +316,16 @@ class HighSpeedComplete194Predictor:
 
     def get_fast_prediction(self, code: str):
         symbol = f"{code}.T"
-        self.safe_api_call()
+        rate_limited_sleep()  # ← レート制限対策
 
         end = datetime.now()
         start = end - timedelta(days=300)
-        df = yf.Ticker(symbol).history(start=start, end=end, interval="1d")
+        
+        try:
+            df = yf.Ticker(symbol).history(start=start, end=end, interval="1d")
+        except Exception as e:
+            return None
+
         if len(df) < 100:
             return None
 
@@ -366,16 +373,16 @@ def get_predictor():
 
 @st.cache_data
 def load_stock_master():
-    # engine='openpyxl' を追加（.xls でも強制的に openpyxl で読む）
-    df = pd.read_excel(STOCK_MASTER_PATH, engine='openpyxl')
+    df = pd.read_excel(STOCK_MASTER_PATH)
     df = df.dropna(subset=["コード"]).copy()
     df["コード"] = df["コード"].astype(str).str.zfill(4)
     df["銘柄名"] = df["銘柄名"].astype(str)
     return df
 
 
-@st.cache_data
+@st.cache_data(ttl=3600)
 def fetch_price_history(code: str, period: str, interval: str):
+    """TTL=1時間のキャッシュでリクエスト数削減"""
     if period == "3ヶ月":
         days = 90
     elif period == "6ヶ月":
@@ -386,12 +393,22 @@ def fetch_price_history(code: str, period: str, interval: str):
         days = 730
     else:
         days = 365 * 5
+    
     end = datetime.now()
     start = end - timedelta(days=days)
     yf_interval = {"日足": "1d", "週足": "1wk", "月足": "1mo"}[interval]
-    df = yf.Ticker(f"{code}.T").history(start=start, end=end, interval=yf_interval)
+    
+    rate_limited_sleep()  # ← レート制限対策
+    
+    try:
+        df = yf.Ticker(f"{code}.T").history(start=start, end=end, interval=yf_interval)
+    except Exception as e:
+        st.error(f"{code} のデータ取得に失敗: {e}")
+        return None
+    
     if df.empty:
         return None
+    
     df.index = pd.to_datetime(df.index).tz_localize(None)
     return df
 
@@ -417,16 +434,16 @@ def main():
         if search:
             s = search.strip()
             df_show = df_master[
-                df_master["コード"].str.contains(s)
-                | df_master["銘柄名"].str.contains(s)
+                df_master["コード"].str.contains(s, na=False)
+                | df_master["銘柄名"].str.contains(s, na=False)
             ]
 
         codes = df_show["コード"].tolist()
-        labels = [f"{c} | {n}" for c, n in zip(df_show["コード"], df_show["銘柄名"])]
         selected_codes = st.multiselect(
-            "表示する銘柄（複数選択可）",
+            "表示する銘柄（最大10銘柄推奨）",
             options=codes,
             format_func=lambda c: f"{c} | {df_master.loc[df_master['コード']==c,'銘柄名'].iloc[0]}",
+            max_selections=10,
         )
 
         st.markdown("---")
@@ -438,45 +455,49 @@ def main():
         st.markdown("---")
         st.subheader("AI分析")
         run_ai = st.button("🤖 選択中銘柄をAI分析")
+        
+        st.info("⚠️ レート制限回避のため、分析は少しずつ実行されます")
 
     st.caption(f"現在の選択銘柄数: {len(selected_codes)}")
 
     # --- AI分析 ---
     ai_results = None
     if run_ai and selected_codes:
-        st.info("AI分析を実行中…少し待ってね")
+        st.info("AI分析を実行中…（1銘柄0.5秒ペース）")
+        progress_bar = st.progress(0)
         rows = []
-        for code in selected_codes:
-            with st.spinner(f"{code} を解析中…"):
+        
+        for i, code in enumerate(selected_codes):
+            with st.spinner(f"{code} を解析中… ({i+1}/{len(selected_codes)})"):
                 pred = predictor.get_fast_prediction(code)
+            
             if pred is not None:
                 name = df_master.loc[df_master["コード"] == code, "銘柄名"].iloc[0]
-                rows.append(
-                    {
-                        "コード": code,
-                        "銘柄名": name,
-                        "予測確率": pred["prediction"],
-                        "最新株価": pred["latest_price"],
-                        "RSI_9": pred["rsi_9"],
-                        "VWAP_20d": pred["vwap_20d"],
-                        "ADX": pred["adx"],
-                        "データ日付": pred["latest_date"].strftime("%Y-%m-%d"),
-                        "何日前": pred["days_old"],
-                    }
-                )
+                rows.append({
+                    "コード": code,
+                    "銘柄名": name,
+                    "予測確率": pred["prediction"],
+                    "最新株価": pred["latest_price"],
+                    "RSI_9": pred["rsi_9"],
+                    "VWAP_20d": pred["vwap_20d"],
+                    "ADX": pred["adx"],
+                    "データ日付": pred["latest_date"].strftime("%Y-%m-%d"),
+                    "何日前": pred["days_old"],
+                })
+            
+            progress_bar.progress((i + 1) / len(selected_codes))
+        
         if rows:
             ai_results = pd.DataFrame(rows).sort_values("予測確率", ascending=False)
             st.subheader("AI分析結果")
             st.dataframe(
-                ai_results.style.format(
-                    {
-                        "予測確率": "{:.3f}",
-                        "最新株価": "{:.0f}",
-                        "RSI_9": "{:.1f}",
-                        "VWAP_20d": "{:.0f}",
-                        "ADX": "{:.1f}",
-                    }
-                ),
+                ai_results.style.format({
+                    "予測確率": "{:.3f}",
+                    "最新株価": "{:.0f}",
+                    "RSI_9": "{:.1f}",
+                    "VWAP_20d": "{:.0f}",
+                    "ADX": "{:.1f}",
+                }),
                 use_container_width=True,
             )
 
@@ -488,9 +509,10 @@ def main():
     st.subheader("チャート表示")
 
     n = len(selected_codes)
-    rows = (n + cols - 1) // cols
+    rows_count = (n + cols - 1) // cols
     idx = 0
-    for _ in range(rows):
+    
+    for _ in range(rows_count):
         cols_container = st.columns(cols)
         for c in range(cols):
             if idx >= n:
@@ -501,16 +523,15 @@ def main():
             with cols_container[c]:
                 st.markdown(f"**{code} {name}**")
                 df_price = fetch_price_history(code, period, interval)
+                
                 if df_price is None or df_price.empty:
                     st.info("データ取得できず")
                 else:
-                    # 出来高が見切れないように subplot で縦を確保
                     import plotly.graph_objects as go
                     from plotly.subplots import make_subplots
 
                     fig = make_subplots(
-                        rows=2,
-                        cols=1,
+                        rows=2, cols=1,
                         shared_xaxes=True,
                         row_heights=[0.7, 0.3],
                         vertical_spacing=0.03,
@@ -525,8 +546,7 @@ def main():
                             close=df_price["Close"],
                             name="Price",
                         ),
-                        row=1,
-                        col=1,
+                        row=1, col=1,
                     )
 
                     fig.add_trace(
@@ -536,8 +556,7 @@ def main():
                             name="Volume",
                             marker_color="lightgray",
                         ),
-                        row=2,
-                        col=1,
+                        row=2, col=1,
                     )
 
                     fig.update_layout(
@@ -557,3 +576,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
